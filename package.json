@@ -1,0 +1,23 @@
+{
+  "name": "dertorrap-anti-afk-bot",
+  "version": "3.0.0",
+  "description": "24/7 Mineflayer Anti-AFK bot with server ping, pathfinding, combat & water survival",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": ["mineflayer", "anti-afk", "minecraft-bot", "http-api", "pathfinder"],
+  "dependencies": {
+    "mineflayer": "^4.23.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "minecraft-data": "^3.63.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
