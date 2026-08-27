@@ -1,10 +1,23 @@
 const mineflayer = require('mineflayer');
+const { pathfinder, Movements, goals } = require('mineflayer-pathfinder');
+const { GoalNear, GoalBlock } = goals;
 const http = require('http');
 const url = require('url');
+const net = require('net');
 require('dotenv').config();
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || null; // optional auth
+const API_KEY = process.env.API_KEY || null;
+
+// ─── Hostile Mob List ──────────────────────────────────────────────────────────
+const HOSTILE_MOBS = new Set([
+  'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'witch',
+  'blaze', 'ghast', 'slime', 'magma_cube', 'enderman', 'endermite',
+  'silverfish', 'phantom', 'drowned', 'husk', 'stray', 'wither_skeleton',
+  'pillager', 'vindicator', 'evoker', 'ravager', 'guardian', 'elder_guardian',
+  'shulker', 'vex', 'zombie_villager', 'zombified_piglin', 'piglin_brute',
+  'hoglin', 'zoglin', 'warden'
+]);
 
 // ─── State ────────────────────────────────────────────────────────────────────
 let state = {
@@ -24,10 +37,25 @@ let state = {
   moveInterval: null,
   sneakActive: false,
 
+  // ── NEW: Server ping & player count state ──────────────────────────────────
+  serverOnline: false,
+  serverPingTimer: null,           // polls every 15s when offline
+  serverCheckTimer: null,          // polls every 60s when online with 2+ players
+  lastServerPing: null,            // { online, playerCount, maxPlayers, version, latency, ts }
+  pingPhase: 'idle',               // 'idle' | 'waiting_online' | 'monitoring'
+
+  // ── NEW: Combat / survival state ───────────────────────────────────────────
+  combatInterval: null,            // ticks mob scan & attack
+  waterInterval: null,             // holds space when in water
+  pathfindingActive: false,
+
   joinTime: null,
   disconnectReason: null,
   lastError: null,
-  logs: [], // last 20 log entries
+  lastErrorCode: null,       // machine-readable error type
+  reconnectAttempts: 0,      // counts consecutive failed attempts
+  reconnectDelay: 15000,     // current delay (backoff)
+  logs: [],
 };
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
@@ -85,6 +113,661 @@ function getUptimeSeconds() {
   return Math.floor((Date.now() - state.joinTime.getTime()) / 1000);
 }
 
+// ─── Minecraft Server SLP Ping (raw TCP, zero extra deps) ─────────────────────
+// Uses the modern 1.7+ Server List Ping handshake via net module.
+// Returns { online: true, playerCount, maxPlayers, version, latency } or { online: false }
+function pingMinecraftServer(host, port, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    let done = false;
+    let buf = Buffer.alloc(0);
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      try { socket.destroy(); } catch (_) {}
+      resolve(result);
+    };
+
+    const socket = net.createConnection({ host, port });
+
+    const timer = setTimeout(() => {
+      finish({ online: false, error: 'timeout' });
+    }, timeoutMs);
+
+    socket.once('connect', () => {
+      // ── Handshake packet (0x00) ──
+      // Fields: packet id, protocol version (VarInt 47 = 1.8, works for all modern),
+      //         server address, port (uint16), next state (1 = status)
+      const hostBuf = Buffer.from(host, 'utf8');
+
+      function writeVarInt(val) {
+        const bytes = [];
+        do {
+          let b = val & 0x7f;
+          val >>>= 7;
+          if (val !== 0) b |= 0x80;
+          bytes.push(b);
+        } while (val !== 0);
+        return Buffer.from(bytes);
+      }
+
+      const handshakePayload = Buffer.concat([
+        writeVarInt(0x00),           // packet id
+        writeVarInt(47),             // protocol version (1.8 — server accepts any)
+        writeVarInt(hostBuf.length), // host string length
+        hostBuf,                     // host
+        Buffer.from([((port >> 8) & 0xff), (port & 0xff)]), // port uint16 BE
+        writeVarInt(1),              // next state: status
+      ]);
+      const handshakeLenBuf = writeVarInt(handshakePayload.length);
+
+      // ── Status Request packet (0x00, no payload) ──
+      const statusRequest = Buffer.from([0x01, 0x00]);
+
+      socket.write(Buffer.concat([handshakeLenBuf, handshakePayload, statusRequest]));
+    });
+
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      try {
+        // Read VarInt length prefix
+        let offset = 0;
+        let packetLen = 0, shift = 0, b;
+        do {
+          if (offset >= buf.length) return; // need more data
+          b = buf[offset++];
+          packetLen |= (b & 0x7f) << shift;
+          shift += 7;
+        } while (b & 0x80);
+
+        if (buf.length < offset + packetLen) return; // incomplete
+
+        // Read packet id VarInt
+        let packetId = 0; shift = 0;
+        do {
+          b = buf[offset++];
+          packetId |= (b & 0x7f) << shift;
+          shift += 7;
+        } while (b & 0x80);
+
+        if (packetId !== 0x00) return finish({ online: false, error: 'bad_packet_id' });
+
+        // Read JSON string length VarInt
+        let strLen = 0; shift = 0;
+        do {
+          b = buf[offset++];
+          strLen |= (b & 0x7f) << shift;
+          shift += 7;
+        } while (b & 0x80);
+
+        const jsonStr = buf.slice(offset, offset + strLen).toString('utf8');
+        const data = JSON.parse(jsonStr);
+
+        clearTimeout(timer);
+        finish({
+          online: true,
+          playerCount: data.players?.online ?? 0,
+          maxPlayers: data.players?.max ?? 0,
+          version: data.version?.name ?? 'unknown',
+          motd: typeof data.description === 'string'
+            ? data.description
+            : (data.description?.text ?? ''),
+          latency: Date.now() - start,
+        });
+      } catch (_) {
+        // Buffer incomplete or parse error — wait for more data
+      }
+    });
+
+    socket.on('error', (err) => {
+      clearTimeout(timer);
+      finish({ online: false, error: err.message });
+    });
+
+    socket.on('close', () => {
+      clearTimeout(timer);
+      if (!done) finish({ online: false, error: 'connection_closed' });
+    });
+  });
+}
+
+// ─── Server Ping Logic ────────────────────────────────────────────────────────
+
+function stopServerPingTimers() {
+  if (state.serverPingTimer) { clearInterval(state.serverPingTimer); state.serverPingTimer = null; }
+  if (state.serverCheckTimer) { clearInterval(state.serverCheckTimer); state.serverCheckTimer = null; }
+}
+
+// Called once after /start — keeps checking until server is online, then hands over to monitorServer()
+async function waitForServerOnline() {
+  if (!state.ip || !state.autoReconnect) return;
+
+  stopServerPingTimers();
+  state.pingPhase = 'waiting_online';
+  log(`Pinging ${state.ip}:${state.port} every 15s until server is online...`);
+
+  const doPing = async () => {
+    if (!state.autoReconnect) return stopServerPingTimers();
+    const result = await pingMinecraftServer(state.ip, state.port);
+    state.lastServerPing = { ...result, ts: new Date().toISOString() };
+
+    if (result.online) {
+      log(`Server online! Players: ${result.playerCount}/${result.maxPlayers}, version: ${result.version}, ping: ${result.latency}ms`);
+      stopServerPingTimers();
+      handleServerOnlineDecision(result.playerCount);
+    } else {
+      log(`Server offline (${result.error || 'no response'}) — retrying in 15s`);
+    }
+  };
+
+  await doPing(); // immediate first check
+  if (state.pingPhase === 'waiting_online') {
+    state.serverPingTimer = setInterval(doPing, 15000);
+  }
+}
+
+// Called after bot connects — monitor every 60s. If players > 1 → stop bot, if ≤ 1 → keep running
+function startServerMonitoring() {
+  if (!state.ip) return;
+  stopServerPingTimers();
+  state.pingPhase = 'monitoring';
+  log('Server monitoring started (60s interval)');
+
+  state.serverCheckTimer = setInterval(async () => {
+    if (!state.autoReconnect) return stopServerPingTimers();
+    const result = await pingMinecraftServer(state.ip, state.port);
+    state.lastServerPing = { ...result, ts: new Date().toISOString() };
+
+    if (!result.online) {
+      log('Server went offline during monitoring');
+      stopBot();
+      waitForServerOnline();
+      return;
+    }
+
+    log(`Monitor check: ${result.playerCount}/${result.maxPlayers} players online`);
+    handleServerOnlineDecision(result.playerCount);
+  }, 60000);
+}
+
+// Core decision: 0-1 players → start/keep bot; 2+ players → stop bot
+async function handleServerOnlineDecision(playerCount) {
+  state.serverOnline = true;
+
+  if (playerCount <= 1) {
+    // ≤ 1 player (bot itself maybe) → make sure bot is running
+    if (!state.connected && !state.reconnectTimer) {
+      log(`Player count ${playerCount} ≤ 1 → starting bot`);
+      createBot();
+    } else {
+      log(`Player count ${playerCount} ≤ 1 → bot already running`);
+    }
+  } else {
+    // 2+ players → stop bot
+    if (state.connected || state.bot) {
+      log(`Player count ${playerCount} ≥ 2 → stopping bot to avoid suspicion`);
+      stopBot();
+    } else {
+      log(`Player count ${playerCount} ≥ 2 → bot already stopped`);
+    }
+    // Switch to monitoring phase to keep checking
+    if (state.pingPhase !== 'monitoring') startServerMonitoring();
+  }
+}
+
+function stopBot() {
+  if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+  stopAllBotSystems();
+  if (state.bot) {
+    try { state.bot.quit('Stopped by server monitor'); } catch (_) {}
+    state.bot = null;
+  }
+  state.connected = false;
+  state.autoReconnect = false; // prevent reconnect loop; waitForServerOnline handles restarts
+}
+
+// ─── Combat & Survival Systems ────────────────────────────────────────────────
+
+function startCombatSystem() {
+  if (state.combatInterval) return;
+  state.combatInterval = setInterval(() => {
+    if (!state.bot || !state.connected) return;
+    try {
+      scanAndAttackHostile();
+    } catch (err) {
+      log(`Combat scan error: ${err.message}`);
+    }
+  }, 1000); // scan every 1s
+  log('Combat system started');
+}
+
+function stopCombatSystem() {
+  if (state.combatInterval) { clearInterval(state.combatInterval); state.combatInterval = null; }
+}
+
+function scanAndAttackHostile() {
+  const bot = state.bot;
+  if (!bot || !bot.entity) return;
+
+  // Find nearest hostile mob within 4 blocks (sword range is ~3.5)
+  const hostile = bot.nearestEntity((entity) => {
+    if (!entity || !entity.name) return false;
+    const mobName = entity.name.toLowerCase().replace(/^minecraft:/, '');
+    if (!HOSTILE_MOBS.has(mobName)) return false;
+    const dist = bot.entity.position.distanceTo(entity.position);
+    return dist <= 4.5;
+  });
+
+  if (!hostile) return;
+
+  const dist = bot.entity.position.distanceTo(hostile.position);
+  log(`Hostile mob nearby: ${hostile.name} at ${dist.toFixed(1)} blocks — attacking`);
+
+  try {
+    // Look at mob first, then attack
+    bot.lookAt(hostile.position.offset(0, hostile.height / 2, 0));
+    bot.attack(hostile);
+  } catch (err) {
+    // mob despawned between scan and attack — safe to ignore
+  }
+}
+
+// ─── Water Survival System ────────────────────────────────────────────────────
+
+function startWaterSurvival() {
+  if (state.waterInterval) return;
+  state.waterInterval = setInterval(() => {
+    if (!state.bot || !state.connected || !state.bot.entity) return;
+    try {
+      const inWater = state.bot.entity.isInWater;
+      if (inWater) {
+        state.bot.setControlState('jump', true); // hold space = swim up
+      } else {
+        // Only release if we were holding jump for water (not for auto-jump)
+        if (!state.jumpInterval) {
+          state.bot.setControlState('jump', false);
+        }
+      }
+    } catch (_) {}
+  }, 500); // check every 500ms
+  log('Water survival system started');
+}
+
+function stopWaterSurvival() {
+  if (state.waterInterval) { clearInterval(state.waterInterval); state.waterInterval = null; }
+}
+
+// ─── Pathfinder Move ──────────────────────────────────────────────────────────
+// Replaces the old random move — uses pathfinder to walk to a random nearby safe block
+// Falls back to raw controls if pathfinder has no path
+
+function startAutoMove() {
+  if (!state.bot || !state.connected) return false;
+
+  // Stop old move interval if any
+  if (state.moveInterval) { clearInterval(state.moveInterval); state.moveInterval = null; }
+
+  state.pathfindingActive = true;
+  log('Auto-move (pathfinding) started');
+
+  // Kick off first move immediately, then repeat every 5s
+  doPathfinderMove();
+  state.moveInterval = setInterval(doPathfinderMove, 5000);
+  return true;
+}
+
+function doPathfinderMove() {
+  const bot = state.bot;
+  if (!bot || !state.connected || !bot.entity) return;
+
+  try {
+    const pos = bot.entity.position;
+    const mcData = require('minecraft-data')(bot.version);
+    const movements = new Movements(bot, mcData);
+    movements.canDig = false;      // don't dig blocks
+    movements.allow1by1towers = false;
+    bot.pathfinder.setMovements(movements);
+
+    // Pick a random target 3-8 blocks away (X/Z only)
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 3 + Math.floor(Math.random() * 5);
+    const tx = Math.floor(pos.x + Math.cos(angle) * dist);
+    const tz = Math.floor(pos.z + Math.sin(angle) * dist);
+    const ty = Math.floor(pos.y);
+
+    // Check if target block is walkable (solid ground under, air at feet & head)
+    const targetGround = bot.blockAt(bot.entity.position.offset(
+      tx - Math.floor(pos.x),
+      -1,
+      tz - Math.floor(pos.z)
+    ));
+
+    if (!targetGround || targetGround.name === 'air' || targetGround.name === 'water') {
+      log('No walkable target nearby — scanning for safe spot');
+      findAndMoveSafeSpot(bot, pos, movements);
+      return;
+    }
+
+    bot.pathfinder.setGoal(new GoalNear(tx, ty, tz, 1));
+    log(`Pathfinding to (${tx}, ${ty}, ${tz})`);
+  } catch (err) {
+    log(`Pathfinder error: ${err.message} — falling back to raw movement`);
+    fallbackMove();
+  }
+}
+
+function findAndMoveSafeSpot(bot, pos, movements) {
+  // Spiral scan up to 10 blocks radius for a safe block
+  for (let r = 1; r <= 10; r++) {
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dz = -r; dz <= r; dz++) {
+        if (Math.abs(dx) !== r && Math.abs(dz) !== r) continue; // only perimeter
+        try {
+          const tx = Math.floor(pos.x) + dx;
+          const tz = Math.floor(pos.z) + dz;
+          const ty = Math.floor(pos.y);
+          const ground = bot.blockAt({ x: tx, y: ty - 1, z: tz });
+          const feet = bot.blockAt({ x: tx, y: ty, z: tz });
+          const head = bot.blockAt({ x: tx, y: ty + 1, z: tz });
+          if (
+            ground && ground.name !== 'air' && ground.name !== 'water' &&
+            feet && feet.name === 'air' &&
+            head && head.name === 'air'
+          ) {
+            bot.pathfinder.setGoal(new GoalNear(tx, ty, tz, 1));
+            log(`Safe spot found at (${tx}, ${ty}, ${tz})`);
+            return;
+          }
+        } catch (_) {}
+      }
+    }
+  }
+  log('No safe spot found within 10 blocks — staying put');
+  fallbackMove();
+}
+
+function fallbackMove() {
+  // Raw movement fallback — original random direction logic
+  if (!state.bot || !state.connected) return;
+  const directions = ['forward', 'back', 'left', 'right'];
+  const dir = directions[Math.floor(Math.random() * directions.length)];
+  try {
+    state.bot.setControlState(dir, true);
+    setTimeout(() => {
+      if (state.bot) state.bot.setControlState(dir, false);
+    }, 800);
+  } catch (_) {}
+}
+
+// ─── Action Functions ─────────────────────────────────────────────────────────
+
+function clearAllActions() {
+  if (state.jumpInterval) { clearInterval(state.jumpInterval); state.jumpInterval = null; }
+  if (state.moveInterval) {
+    clearInterval(state.moveInterval);
+    state.moveInterval = null;
+    state.pathfindingActive = false;
+    // Stop pathfinder goal if running
+    if (state.bot) {
+      try { state.bot.pathfinder.setGoal(null); } catch (_) {}
+    }
+  }
+  if (state.bot && state.sneakActive) {
+    try { state.bot.setControlState('sneak', false); } catch (_) {}
+    state.sneakActive = false;
+  }
+}
+
+function stopAllBotSystems() {
+  clearAllActions();
+  stopCombatSystem();
+  stopWaterSurvival();
+}
+
+function startAutoJump() {
+  if (!state.bot || !state.connected) return false;
+  if (state.sneakActive) {
+    try { state.bot.setControlState('sneak', false); } catch (_) {}
+    state.sneakActive = false;
+  }
+  if (state.jumpInterval) clearInterval(state.jumpInterval);
+  state.jumpInterval = setInterval(() => {
+    if (state.bot && state.connected) {
+      try {
+        state.bot.setControlState('jump', true);
+        setTimeout(() => { if (state.bot) state.bot.setControlState('jump', false); }, 200);
+      } catch (_) {}
+    }
+  }, 3000);
+  log('Auto-jump started');
+  return true;
+}
+
+function startSneak() {
+  if (!state.bot || !state.connected) return false;
+  if (state.jumpInterval) { clearInterval(state.jumpInterval); state.jumpInterval = null; }
+  try {
+    state.bot.setControlState('sneak', true);
+    state.sneakActive = true;
+  } catch (_) { return false; }
+  log('Sneak started');
+  return true;
+}
+
+// ─── Bot Creation ─────────────────────────────────────────────────────────────
+
+// Classify error messages into known categories for smart handling
+function classifyError(msg) {
+  if (!msg) return 'unknown';
+  const m = msg.toLowerCase();
+  // Connection / network
+  if (m.includes('econnrefused'))            return 'conn_refused';      // server not running
+  if (m.includes('enotfound'))               return 'dns_fail';          // bad hostname
+  if (m.includes('etimedout') || m.includes('timed out')) return 'timeout'; // firewall / unreachable
+  if (m.includes('econnreset') || m.includes('connection reset')) return 'conn_reset';
+  if (m.includes('enetunreach') || m.includes('network unreachable')) return 'net_unreachable';
+  if (m.includes('ehostunreach'))            return 'host_unreachable';
+  if (m.includes('epipe') || m.includes('broken pipe')) return 'pipe_broken';
+  if (m.includes('socket hang up'))         return 'socket_hangup';
+  // Protocol / version
+  if (m.includes('unsupported') || m.includes('outdated') || m.includes('version')) return 'version_mismatch';
+  if (m.includes('invalid packet') || m.includes('bad packet')) return 'bad_packet';
+  if (m.includes('end of stream'))           return 'end_of_stream';
+  // Auth / login
+  if (m.includes('invalid session') || m.includes('failed to verify')) return 'auth_fail';
+  if (m.includes('too many') || m.includes('rate limit')) return 'rate_limit';
+  if (m.includes('banned') || m.includes('not whitelisted')) return 'access_denied';
+  // Kick messages
+  if (m.includes('kicked'))                  return 'kicked';
+  if (m.includes('disconnect'))              return 'disconnect';
+  return 'unknown';
+}
+
+// Returns how long to wait before next reconnect (exponential backoff, max 5 min)
+function getReconnectDelay(attempts) {
+  const base = 10000;   // 10s
+  const max  = 300000;  // 5 min
+  const delay = Math.min(base * Math.pow(1.8, attempts), max);
+  // Add ±10% jitter so multiple instances don't pile up
+  return Math.floor(delay * (0.9 + Math.random() * 0.2));
+}
+
+function createBot() {
+  if (state.bot) {
+    stopAllBotSystems();
+    state.bot.removeAllListeners();
+    try { state.bot.quit(); } catch (_) {}
+    state.bot = null;
+    state.connected = false;
+  }
+
+  log(`Connecting to ${state.ip}:${state.port} as ${state.botUsername} (attempt #${state.reconnectAttempts + 1})`);
+
+  try {
+    state.bot = mineflayer.createBot({
+      host: state.ip,
+      port: state.port,
+      username: state.botUsername,
+      version: state.mcVersion || false,
+      auth: state.mcAuth,
+      keepAlive: true,          // respond to server keep-alive packets
+      checkTimeoutInterval: 30000, // detect dead connection after 30s silence
+      closeTimeout: 120,        // ms to wait for graceful close
+    });
+  } catch (err) {
+    const code = classifyError(err.message);
+    state.lastError = err.message;
+    state.lastErrorCode = code;
+    log(`❌ Failed to create bot [${code}]: ${err.message}`);
+    if (state.autoReconnect) scheduleReconnect(code);
+    return false;
+  }
+
+  // Load pathfinder plugin
+  try {
+    state.bot.loadPlugin(pathfinder);
+  } catch (err) {
+    log(`⚠️  Pathfinder load error: ${err.message}`);
+  }
+
+  // ── Successful spawn ────────────────────────────────────────────────────────
+  state.bot.once('spawn', () => {
+    state.connected = true;
+    state.joinTime = new Date();
+    state.disconnectReason = null;
+    state.lastError = null;
+    state.lastErrorCode = null;
+    state.reconnectAttempts = 0;    // reset backoff on success
+    state.reconnectDelay = 15000;
+    log(`✅ Bot spawned on ${state.ip}:${state.port}`);
+    startCombatSystem();
+    startWaterSurvival();
+    startServerMonitoring();
+  });
+
+  // ── Protocol / network errors ───────────────────────────────────────────────
+  state.bot.on('error', (err) => {
+    const code = classifyError(err.message);
+    state.lastError = err.message;
+    state.lastErrorCode = code;
+
+    const msgs = {
+      conn_refused:   '❌ Server refused connection — server may be offline or port blocked',
+      dns_fail:       '❌ DNS lookup failed — check the server IP/hostname',
+      timeout:        '⏱️  Connection timed out — server unreachable or firewalled',
+      conn_reset:     '🔌 Connection reset by server',
+      net_unreachable:'🌐 Network unreachable — check host network',
+      host_unreachable:'🌐 Host unreachable',
+      pipe_broken:    '🔌 Broken pipe — server closed connection abruptly',
+      socket_hangup:  '🔌 Socket hang up — server dropped connection',
+      version_mismatch:'⚠️  Protocol/version mismatch — try setting MC_VERSION manually',
+      bad_packet:     '⚠️  Bad packet received — possible version mismatch',
+      end_of_stream:  '⚠️  End of stream — server closed the connection unexpectedly',
+      auth_fail:      '🔒 Auth failed — check MC_AUTH setting (use offline for cracked servers)',
+      rate_limit:     '⏳ Rate limited — too many login attempts, waiting longer...',
+      access_denied:  '🚫 Access denied — bot may be banned or not whitelisted',
+    };
+
+    log(`Bot error [${code}]: ${msgs[code] || err.message}`);
+
+    // For rate limiting, force a longer wait
+    if (code === 'rate_limit') {
+      state.reconnectAttempts = Math.max(state.reconnectAttempts, 4);
+    }
+  });
+
+  // ── Kicked ──────────────────────────────────────────────────────────────────
+  state.bot.on('kicked', (reason) => {
+    const wasConnected = state.connected;
+    state.connected = false;
+    let reasonStr = reason;
+    try {
+      // Reason can be a JSON chat component — extract text
+      const parsed = typeof reason === 'string' ? JSON.parse(reason) : reason;
+      reasonStr = parsed?.text || parsed?.translate || JSON.stringify(parsed);
+    } catch (_) { reasonStr = String(reason); }
+
+    state.disconnectReason = reasonStr.slice(0, 300);
+    const code = classifyError(reasonStr);
+    state.lastErrorCode = code;
+
+    log(`🚫 Bot kicked [${code}]: ${reasonStr.slice(0, 150)}`);
+    stopAllBotSystems();
+
+    // Don't reconnect if server explicitly banned/whitelisted us
+    if (code === 'access_denied') {
+      log('⛔ Access denied kick — stopping auto-reconnect');
+      state.autoReconnect = false;
+      return;
+    }
+
+    if (wasConnected && state.autoReconnect) scheduleReconnect(code);
+  });
+
+  // ── Connection ended ────────────────────────────────────────────────────────
+  state.bot.on('end', (reason) => {
+    const wasConnected = state.connected;
+    if (!wasConnected && !reason) return; // already handled
+    state.connected = false;
+    const code = classifyError(String(reason || ''));
+    state.lastErrorCode = state.lastErrorCode || code;
+    log(`🔌 Bot disconnected: ${reason || 'no reason given'}`);
+    stopAllBotSystems();
+    if (state.autoReconnect) scheduleReconnect(code);
+  });
+
+  // ── Death ───────────────────────────────────────────────────────────────────
+  state.bot.on('death', () => {
+    log('💀 Bot died — respawning');
+    try { state.bot.respawn(); } catch (_) {}
+  });
+
+  // ── Login rejected (pre-spawn errors like "Failed to login") ───────────────
+  state.bot.on('loginKick', (message) => {
+    const code = classifyError(message);
+    state.lastError = message;
+    state.lastErrorCode = code;
+    state.connected = false;
+    log(`🔒 Login rejected [${code}]: ${message}`);
+    stopAllBotSystems();
+    if (state.autoReconnect) scheduleReconnect(code);
+  });
+
+  return true;
+}
+
+// ─── Smart Reconnect (exponential backoff) ────────────────────────────────────
+function scheduleReconnect(errorCode) {
+  if (!state.autoReconnect) return;
+  if (state.reconnectTimer) return;
+
+  state.reconnectAttempts++;
+  const delay = getReconnectDelay(state.reconnectAttempts - 1);
+  state.reconnectDelay = delay;
+  const delaySec = Math.round(delay / 1000);
+
+  const tips = {
+    dns_fail:        ' (check server hostname)',
+    version_mismatch:' (try setting MC_VERSION in env)',
+    auth_fail:       ' (check MC_AUTH=offline for cracked servers)',
+    conn_refused:    ' (server may be starting up)',
+    rate_limit:      ' (rate limited — waiting longer)',
+  };
+  const tip = tips[errorCode] || '';
+
+  log(`⏳ Reconnect attempt #${state.reconnectAttempts} in ${delaySec}s${tip}`);
+
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
+    if (state.autoReconnect) {
+      log(`🔄 Auto-reconnecting (attempt #${state.reconnectAttempts})...`);
+      createBot();
+    }
+  }, delay);
+}
+
+// ─── Full Status ──────────────────────────────────────────────────────────────
 function getFullStatus() {
   const uptime = getUptimeSeconds();
   const bot = state.bot;
@@ -95,6 +778,7 @@ function getFullStatus() {
       liveStats = {
         health: bot.health ?? null,
         food: bot.food ?? null,
+        inWater: bot.entity?.isInWater ?? false,
         position: bot.entity?.position
           ? {
               x: parseFloat(bot.entity.position.x.toFixed(2)),
@@ -126,14 +810,24 @@ function getFullStatus() {
       uptimeFormatted: uptime ? formatUptime(uptime) : null,
       joinTime: state.joinTime ? state.joinTime.toISOString() : null,
       lastError: state.lastError,
+      lastErrorCode: state.lastErrorCode,
+      reconnectAttempts: state.reconnectAttempts,
+      reconnectDelay: state.reconnectDelay,
       disconnectReason: state.disconnectReason
         ? String(state.disconnectReason).slice(0, 200)
         : null,
+    },
+    serverPing: {
+      phase: state.pingPhase,
+      lastPing: state.lastServerPing,
     },
     actions: {
       jump: !!state.jumpInterval,
       move: !!state.moveInterval,
       sneak: state.sneakActive,
+      pathfinding: state.pathfindingActive,
+      combat: !!state.combatInterval,
+      waterSurvival: !!state.waterInterval,
     },
     liveStats,
     recentLogs: state.logs.slice(-10),
@@ -151,140 +845,6 @@ function jsonError(res, code, message, extra = {}) {
   res.end(JSON.stringify({ success: false, error: message, ...extra }, null, 2));
 }
 
-// ─── Action Functions ─────────────────────────────────────────────────────────
-function clearAllActions() {
-  if (state.jumpInterval) { clearInterval(state.jumpInterval); state.jumpInterval = null; }
-  if (state.moveInterval) { clearInterval(state.moveInterval); state.moveInterval = null; }
-  if (state.bot && state.sneakActive) {
-    try { state.bot.setControlState('sneak', false); } catch (_) {}
-    state.sneakActive = false;
-  }
-}
-
-function startAutoJump() {
-  if (!state.bot || !state.connected) return false;
-  if (state.sneakActive) {
-    try { state.bot.setControlState('sneak', false); } catch (_) {}
-    state.sneakActive = false;
-  }
-  if (state.jumpInterval) clearInterval(state.jumpInterval);
-  state.jumpInterval = setInterval(() => {
-    if (state.bot && state.connected) {
-      try {
-        state.bot.setControlState('jump', true);
-        setTimeout(() => { if (state.bot) state.bot.setControlState('jump', false); }, 200);
-      } catch (_) {}
-    }
-  }, 3000);
-  log('Auto-jump started');
-  return true;
-}
-
-function startAutoMove() {
-  if (!state.bot || !state.connected) return false;
-  const directions = ['forward', 'back', 'left', 'right'];
-  let currentDir = null;
-  if (state.moveInterval) clearInterval(state.moveInterval);
-  state.moveInterval = setInterval(() => {
-    if (!state.bot || !state.connected) return;
-    try {
-      if (currentDir) state.bot.setControlState(currentDir, false);
-      currentDir = directions[Math.floor(Math.random() * directions.length)];
-      state.bot.setControlState(currentDir, true);
-    } catch (_) {}
-  }, 1000);
-  log('Auto-move started');
-  return true;
-}
-
-function startSneak() {
-  if (!state.bot || !state.connected) return false;
-  if (state.jumpInterval) { clearInterval(state.jumpInterval); state.jumpInterval = null; }
-  try {
-    state.bot.setControlState('sneak', true);
-    state.sneakActive = true;
-  } catch (_) { return false; }
-  log('Sneak started');
-  return true;
-}
-
-// ─── Bot Creation ─────────────────────────────────────────────────────────────
-function createBot() {
-  if (state.bot) {
-    clearAllActions();
-    state.bot.removeAllListeners();
-    try { state.bot.quit(); } catch (_) {}
-    state.bot = null;
-    state.connected = false;
-  }
-
-  log(`Connecting to ${state.ip}:${state.port} as ${state.botUsername}`);
-
-  try {
-    state.bot = mineflayer.createBot({
-      host: state.ip,
-      port: state.port,
-      username: state.botUsername,
-      version: state.mcVersion || false,
-      auth: state.mcAuth,
-    });
-  } catch (err) {
-    state.lastError = err.message;
-    log(`Failed to create bot: ${err.message}`);
-    return false;
-  }
-
-  state.bot.once('spawn', () => {
-    state.connected = true;
-    state.joinTime = new Date();
-    state.disconnectReason = null;
-    state.lastError = null;
-    log(`Bot spawned on ${state.ip}:${state.port}`);
-  });
-
-  state.bot.on('error', (err) => {
-    state.lastError = err.message;
-    log(`Bot error: ${err.message}`);
-  });
-
-  state.bot.on('kicked', (reason) => {
-    const wasConnected = state.connected;
-    state.connected = false;
-    state.disconnectReason = reason;
-    clearAllActions();
-    log(`Bot kicked: ${JSON.stringify(reason)}`);
-    if (wasConnected) scheduleReconnect();
-  });
-
-  state.bot.on('end', (reason) => {
-    if (!state.connected) return;
-    state.connected = false;
-    clearAllActions();
-    log(`Bot disconnected: ${reason}`);
-    scheduleReconnect();
-  });
-
-  state.bot.on('death', () => {
-    log('Bot died — respawning');
-    try { state.bot.respawn(); } catch (_) {}
-  });
-
-  return true;
-}
-
-function scheduleReconnect() {
-  if (!state.autoReconnect) return;
-  if (state.reconnectTimer) return;
-  log('Scheduling reconnect in 15s...');
-  state.reconnectTimer = setTimeout(() => {
-    state.reconnectTimer = null;
-    if (state.autoReconnect) {
-      log('Auto-reconnecting...');
-      createBot();
-    }
-  }, 15000);
-}
-
 // ─── HTML Dashboard ───────────────────────────────────────────────────────────
 function renderDashboard() {
   const s = getFullStatus();
@@ -292,9 +852,16 @@ function renderDashboard() {
   const conn = s.connection;
   const actions = s.actions;
   const setup = s.setup;
+  const ping = s.serverPing;
 
   const connColor = conn.connected ? '#22c55e' : '#ef4444';
   const connLabel = conn.connected ? '🟢 Connected' : '🔴 Disconnected';
+
+  const phaseLabel = {
+    idle: '⏸️ Idle',
+    waiting_online: '⏳ Waiting for Server...',
+    monitoring: '📡 Monitoring (60s)',
+  }[ping.phase] || ping.phase;
 
   const statCard = (label, value, color = '#e2e8f0') => `
     <div class="card">
@@ -304,6 +871,20 @@ function renderDashboard() {
 
   const badge = (on, labelOn, labelOff) =>
     `<span class="badge ${on ? 'badge-on' : 'badge-off'}">${on ? labelOn : labelOff}</span>`;
+
+  const pingCard = ping.lastPing
+    ? (ping.lastPing.online
+      ? `<div class="ping-card online">
+          <span class="ping-status">🟢 Online</span>
+          <span class="ping-detail">👥 ${ping.lastPing.playerCount}/${ping.lastPing.maxPlayers} players</span>
+          <span class="ping-detail">🏓 ${ping.lastPing.latency}ms</span>
+          <span class="ping-detail">🗂️ ${ping.lastPing.version}</span>
+        </div>`
+      : `<div class="ping-card offline">
+          <span class="ping-status">🔴 Server Offline</span>
+          <span class="ping-detail">${ping.lastPing.error || 'No response'}</span>
+        </div>`)
+    : `<div class="ping-card idle"><span class="ping-status">⏸️ Not pinged yet</span></div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -320,129 +901,65 @@ function renderDashboard() {
       min-height: 100vh;
       padding: 24px 16px;
     }
-    .header {
-      text-align: center;
-      margin-bottom: 32px;
-    }
+    .header { text-align: center; margin-bottom: 32px; }
     .header h1 {
-      font-size: 1.8rem;
-      font-weight: 800;
+      font-size: 1.8rem; font-weight: 800;
       background: linear-gradient(135deg, #60a5fa, #a78bfa);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
       letter-spacing: 1px;
     }
-    .header p {
-      color: #64748b;
-      font-size: 0.85rem;
-      margin-top: 6px;
-    }
+    .header p { color: #64748b; font-size: 0.85rem; margin-top: 6px; }
     .status-banner {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 12px;
-      padding: 16px 24px;
-      margin-bottom: 24px;
-      font-size: 1.1rem;
-      font-weight: 600;
+      display: flex; align-items: center; justify-content: center;
+      gap: 12px; background: #1e293b; border: 1px solid #334155;
+      border-radius: 12px; padding: 16px 24px; margin-bottom: 24px;
+      font-size: 1.1rem; font-weight: 600;
     }
     .dot {
-      width: 12px; height: 12px;
-      border-radius: 50%;
-      background: ${connColor};
-      box-shadow: 0 0 8px ${connColor};
+      width: 12px; height: 12px; border-radius: 50%;
+      background: ${connColor}; box-shadow: 0 0 8px ${connColor};
       animation: ${conn.connected ? 'pulse 2s infinite' : 'none'};
     }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
-    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
     .section { margin-bottom: 24px; }
     .section-title {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 1.5px;
-      color: #60a5fa;
-      margin-bottom: 12px;
+      font-size: 0.75rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1.5px;
+      color: #60a5fa; margin-bottom: 12px;
     }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-      gap: 12px;
-    }
-    .card {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 10px;
-      padding: 14px 16px;
-    }
-    .card-label {
-      font-size: 0.72rem;
-      color: #64748b;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      margin-bottom: 6px;
-    }
-    .card-value {
-      font-size: 1rem;
-      font-weight: 600;
-      word-break: break-all;
-    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 14px 16px; }
+    .card-label { font-size: 0.72rem; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+    .card-value { font-size: 1rem; font-weight: 600; word-break: break-all; }
     .na { color: #475569; font-style: italic; }
-    .badge {
-      display: inline-block;
-      padding: 4px 12px;
-      border-radius: 999px;
-      font-size: 0.78rem;
-      font-weight: 600;
-    }
-    .badge-on { background: #14532d; color: #86efac; border: 1px solid #22c55e; }
+    .badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; }
+    .badge-on  { background: #14532d; color: #86efac; border: 1px solid #22c55e; }
     .badge-off { background: #1c1917; color: #78716c; border: 1px solid #44403c; }
-    .actions-grid {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .log-box {
-      background: #0f172a;
+    .actions-grid { display: flex; gap: 10px; flex-wrap: wrap; }
+    .ping-card {
+      border-radius: 10px; padding: 14px 18px;
+      display: flex; gap: 16px; flex-wrap: wrap; align-items: center;
       border: 1px solid #334155;
-      border-radius: 10px;
-      padding: 14px 16px;
-      font-family: 'Courier New', monospace;
-      font-size: 0.78rem;
-      color: #94a3b8;
-      max-height: 220px;
-      overflow-y: auto;
+    }
+    .ping-card.online  { background: #052e16; border-color: #22c55e; }
+    .ping-card.offline { background: #2d0a0a; border-color: #ef4444; }
+    .ping-card.idle    { background: #1e293b; }
+    .ping-status { font-weight: 700; font-size: 1rem; }
+    .ping-detail { font-size: 0.85rem; color: #94a3b8; }
+    .ping-phase { font-size: 0.78rem; color: #64748b; margin-top: 8px; }
+    .log-box {
+      background: #0f172a; border: 1px solid #334155; border-radius: 10px;
+      padding: 14px 16px; font-family: 'Courier New', monospace;
+      font-size: 0.78rem; color: #94a3b8; max-height: 220px; overflow-y: auto;
     }
     .log-entry { padding: 3px 0; border-bottom: 1px solid #1e293b; }
     .log-time { color: #475569; margin-right: 8px; }
-    .endpoints-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 10px;
-    }
-    .endpoint {
-      background: #1e293b;
-      border: 1px solid #334155;
-      border-radius: 8px;
-      padding: 10px 14px;
-      font-family: monospace;
-      font-size: 0.82rem;
-    }
+    .endpoints-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+    .endpoint { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 10px 14px; font-family: monospace; font-size: 0.82rem; }
     .endpoint .method { color: #60a5fa; font-weight: 700; margin-right: 6px; }
     .endpoint .path { color: #a78bfa; }
     .endpoint .desc { color: #64748b; font-size: 0.72rem; margin-top: 4px; font-family: sans-serif; }
-    .refresh-bar {
-      text-align: center;
-      color: #475569;
-      font-size: 0.78rem;
-      margin-top: 28px;
-    }
+    .refresh-bar { text-align: center; color: #475569; font-size: 0.78rem; margin-top: 28px; }
     .timestamp { color: #475569; font-size: 0.72rem; }
   </style>
 </head>
@@ -457,6 +974,13 @@ function renderDashboard() {
   <div class="dot"></div>
   <span style="color:${connColor}">${connLabel}</span>
   ${conn.connected ? `<span style="color:#64748b;font-size:0.85rem">· Uptime: ${conn.uptimeFormatted}</span>` : ''}
+</div>
+
+<!-- Server Ping Status -->
+<div class="section">
+  <div class="section-title">🌐 Server Status</div>
+  ${pingCard}
+  <div class="ping-phase">Phase: ${phaseLabel}</div>
 </div>
 
 <!-- Setup -->
@@ -491,6 +1015,7 @@ ${live ? `
   <div class="grid">
     ${statCard('❤️ Health', live.health != null ? `${live.health.toFixed(1)} / 20` : null, live.health < 5 ? '#ef4444' : '#22c55e')}
     ${statCard('🍖 Food', live.food != null ? `${live.food} / 20` : null)}
+    ${statCard('🌊 In Water', live.inWater ? '💧 Yes' : '🏃 No', live.inWater ? '#38bdf8' : '#94a3b8')}
     ${statCard('🌍 Dimension', live.dimension)}
     ${statCard('🏓 Ping', live.ping != null ? `${live.ping}ms` : null)}
     ${statCard('🎮 Game Mode', live.gameMode)}
@@ -500,11 +1025,13 @@ ${live ? `
 
 <!-- Actions -->
 <div class="section">
-  <div class="section-title">🕹️ Active Actions</div>
+  <div class="section-title">🕹️ Active Systems</div>
   <div class="actions-grid">
-    ${badge(actions.jump, '🐸 Auto-Jump ON', '🐸 Auto-Jump OFF')}
-    ${badge(actions.move, '🚶 Auto-Move ON', '🚶 Auto-Move OFF')}
-    ${badge(actions.sneak, '🦆 Sneak ON', '🦆 Sneak OFF')}
+    ${badge(actions.jump,          '🐸 Auto-Jump ON',     '🐸 Auto-Jump OFF')}
+    ${badge(actions.move,          '🚶 Pathfinding ON',   '🚶 Pathfinding OFF')}
+    ${badge(actions.sneak,         '🦆 Sneak ON',         '🦆 Sneak OFF')}
+    ${badge(actions.combat,        '⚔️ Combat ON',        '⚔️ Combat OFF')}
+    ${badge(actions.waterSurvival, '🌊 Water Guard ON',   '🌊 Water Guard OFF')}
   </div>
 </div>
 
@@ -517,13 +1044,14 @@ ${live ? `
     <div class="endpoint"><span class="method">GET</span><span class="path">/start</span><div class="desc">Connect bot to server</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/stop</span><div class="desc">Disconnect bot</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/jump</span><div class="desc">Start auto-jump (3s)</div></div>
-    <div class="endpoint"><span class="method">GET</span><span class="path">/move</span><div class="desc">Start auto-move (1s)</div></div>
+    <div class="endpoint"><span class="method">GET</span><span class="path">/move</span><div class="desc">Pathfinding move</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/sneak</span><div class="desc">Toggle sneak mode</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/stopaction</span><div class="desc">Stop all actions</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/ip?value=x</span><div class="desc">Set server IP</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/port?value=x</span><div class="desc">Set server port</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/rename?value=x</span><div class="desc">Rename bot username</div></div>
     <div class="endpoint"><span class="method">GET</span><span class="path">/version?value=x</span><div class="desc">Set MC version</div></div>
+    <div class="endpoint"><span class="method">GET</span><span class="path">/pingserver</span><div class="desc">Manual server ping</div></div>
   </div>
 </div>
 
@@ -553,38 +1081,54 @@ const server = http.createServer((req, res) => {
   const path = parsed.pathname.replace(/\/$/, '') || '/';
   const query = parsed.query;
 
-  // Optional API key check (skip for /health)
   if (API_KEY && path !== '/health' && query.key !== API_KEY) {
     return jsonError(res, 401, 'Unauthorized. Pass ?key=YOUR_API_KEY');
   }
 
-  // ── GET /health ──────────────────────────────────────────────────────────
+  // ── GET /health ────────────────────────────────────────────────────────────
   if (path === '/health' || path === '/') {
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html')) {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       return res.end(renderDashboard());
     }
-    // If hit via API / UptimeRobot
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     return res.end(JSON.stringify({ success: true, ...getFullStatus() }, null, 2));
   }
 
-  // ── GET /status ──────────────────────────────────────────────────────────
+  // ── GET /status ────────────────────────────────────────────────────────────
   if (path === '/status') {
     return jsonOk(res, getFullStatus());
   }
 
-  // ── GET /ip?value=x ──────────────────────────────────────────────────────
+  // ── GET /pingserver ────────────────────────────────────────────────────────
+  if (path === '/pingserver') {
+    if (!state.ip) return jsonError(res, 400, 'IP not set. Hit /ip?value=x first');
+    pingMinecraftServer(state.ip, state.port).then((result) => {
+      state.lastServerPing = { ...result, ts: new Date().toISOString() };
+      jsonOk(res, { message: 'Ping complete', result });
+    }).catch((err) => {
+      jsonError(res, 500, `Ping failed: ${err.message}`);
+    });
+    return; // async, don't fall through
+  }
+
+  // ── GET /ip?value=x ───────────────────────────────────────────────────────
   if (path === '/ip') {
     const value = query.value;
-    if (!value) return jsonError(res, 400, 'Missing ?value=<ip-address>');
+    if (!value) {
+      // No value = clear IP
+      const old = state.ip;
+      state.ip = null;
+      log('IP cleared');
+      return jsonOk(res, { message: 'IP cleared', previousIp: old || null, readyToStart: false });
+    }
     state.ip = value;
     log(`IP set to ${state.ip}`);
     return jsonOk(res, { message: `IP set to ${state.ip}`, ip: state.ip, port: state.port, readyToStart: state.portSet });
   }
 
-  // ── GET /port?value=x ────────────────────────────────────────────────────
+  // ── GET /port?value=x ─────────────────────────────────────────────────────
   if (path === '/port') {
     const p = parseInt(query.value);
     if (!query.value || isNaN(p) || p < 1 || p > 65535)
@@ -595,7 +1139,7 @@ const server = http.createServer((req, res) => {
     return jsonOk(res, { message: `Port set to ${state.port}`, ip: state.ip, port: state.port, readyToStart: !!state.ip });
   }
 
-  // ── GET /rename?value=x ──────────────────────────────────────────────────
+  // ── GET /rename?value=x ───────────────────────────────────────────────────
   if (path === '/rename') {
     const name = query.value;
     if (!name) return jsonError(res, 400, 'Missing ?value=<username>');
@@ -604,10 +1148,10 @@ const server = http.createServer((req, res) => {
     const old = state.botUsername;
     state.botUsername = name;
     log(`Bot renamed from ${old} to ${name}`);
-    return jsonOk(res, { message: `Bot renamed`, oldUsername: old, newUsername: name, note: state.connected ? 'Use /stop then /start to apply' : 'Will apply on next /start' });
+    return jsonOk(res, { message: 'Bot renamed', oldUsername: old, newUsername: name, note: state.connected ? 'Use /stop then /start to apply' : 'Will apply on next /start' });
   }
 
-  // ── GET /version?value=x ─────────────────────────────────────────────────
+  // ── GET /version?value=x ──────────────────────────────────────────────────
   if (path === '/version') {
     const v = query.value;
     if (!v) return jsonError(res, 400, 'Missing ?value=<version> e.g. 1.20.1 or auto');
@@ -622,26 +1166,42 @@ const server = http.createServer((req, res) => {
     return jsonOk(res, { message: `Version set to ${v}`, version: v });
   }
 
-  // ── GET /start ───────────────────────────────────────────────────────────
+  // ── GET /start ─────────────────────────────────────────────────────────────
   if (path === '/start') {
     if (!state.ip && !state.portSet) return jsonError(res, 400, 'Both IP and Port are not set', { hint: 'Hit /ip?value=x and /port?value=x first' });
-    if (!state.ip) return jsonError(res, 400, 'IP not set', { hint: `Hit /ip?value=<address>`, portAlreadySet: state.port });
+    if (!state.ip) return jsonError(res, 400, 'IP not set', { hint: 'Hit /ip?value=<address>', portAlreadySet: state.port });
     if (!state.portSet) return jsonError(res, 400, 'Port not set', { hint: 'Hit /port?value=25565', ipAlreadySet: state.ip });
     if (state.connected) return jsonError(res, 409, 'Bot is already connected', { server: `${state.ip}:${state.port}`, hint: 'Hit /stop first' });
 
     state.autoReconnect = true;
+    state.reconnectAttempts = 0;   // reset backoff on fresh /start
+    state.reconnectDelay = 15000;
+    state.lastError = null;
+    state.lastErrorCode = null;
     if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
-    const ok = createBot();
-    if (!ok) return jsonError(res, 500, 'Failed to initialize bot', { lastError: state.lastError });
-    return jsonOk(res, { message: `Connecting to ${state.ip}:${state.port}`, username: state.botUsername, autoReconnect: true, note: 'Check /status for connection result' });
+
+    // Ping server first, then decide whether to connect
+    jsonOk(res, {
+      message: `Pinging ${state.ip}:${state.port} before connecting...`,
+      username: state.botUsername,
+      note: 'Check /status or /health — bot will start if server is online with ≤1 player',
+    });
+    waitForServerOnline(); // async, runs in background
+    return;
   }
 
-  // ── GET /stop ────────────────────────────────────────────────────────────
+  // ── GET /stop ──────────────────────────────────────────────────────────────
   if (path === '/stop') {
-    if (!state.bot && !state.connected) return jsonError(res, 400, 'Bot is not running', { hint: 'Use /start to connect first' });
+    if (!state.bot && !state.connected && state.pingPhase === 'idle') {
+      return jsonError(res, 400, 'Bot is not running', { hint: 'Use /start to connect first' });
+    }
     state.autoReconnect = false;
+    state.reconnectAttempts = 0;
+    state.reconnectDelay = 15000;
     if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
-    clearAllActions();
+    stopServerPingTimers();
+    state.pingPhase = 'idle';
+    stopAllBotSystems();
     if (state.bot) {
       try { state.bot.quit('Stopped via API'); } catch (_) {}
       state.bot = null;
@@ -651,7 +1211,7 @@ const server = http.createServer((req, res) => {
     return jsonOk(res, { message: 'Bot stopped', autoReconnect: false });
   }
 
-  // ── GET /jump ────────────────────────────────────────────────────────────
+  // ── GET /jump ──────────────────────────────────────────────────────────────
   if (path === '/jump') {
     if (!state.connected) return jsonError(res, 400, 'Bot is not connected', { hint: 'Use /start first' });
     if (state.sneakActive) {
@@ -663,15 +1223,19 @@ const server = http.createServer((req, res) => {
     return jsonOk(res, { message: 'Auto-jump started', intervalSeconds: 3, sneakStopped: true });
   }
 
-  // ── GET /move ────────────────────────────────────────────────────────────
+  // ── GET /move ──────────────────────────────────────────────────────────────
   if (path === '/move') {
     if (!state.connected) return jsonError(res, 400, 'Bot is not connected', { hint: 'Use /start first' });
     const ok = startAutoMove();
-    if (!ok) return jsonError(res, 500, 'Failed to start auto-move');
-    return jsonOk(res, { message: 'Auto-move started', intervalSeconds: 1, directions: ['forward', 'back', 'left', 'right'] });
+    if (!ok) return jsonError(res, 500, 'Failed to start pathfinding move');
+    return jsonOk(res, {
+      message: 'Pathfinding auto-move started',
+      intervalSeconds: 5,
+      info: 'Bot will pathfind to safe nearby blocks. Falls back to raw movement if no path found.',
+    });
   }
 
-  // ── GET /sneak ───────────────────────────────────────────────────────────
+  // ── GET /sneak ─────────────────────────────────────────────────────────────
   if (path === '/sneak') {
     if (!state.connected) return jsonError(res, 400, 'Bot is not connected', { hint: 'Use /start first' });
     const ok = startSneak();
@@ -679,33 +1243,35 @@ const server = http.createServer((req, res) => {
     return jsonOk(res, { message: 'Sneak mode activated', jumpStopped: true });
   }
 
-  // ── GET /stopaction ──────────────────────────────────────────────────────
+  // ── GET /stopaction ────────────────────────────────────────────────────────
   if (path === '/stopaction') {
     clearAllActions();
     log('All actions stopped via API');
-    return jsonOk(res, { message: 'All actions stopped', jump: false, move: false, sneak: false });
+    return jsonOk(res, { message: 'All actions stopped', jump: false, move: false, sneak: false, pathfinding: false });
   }
 
-  // ── 404 ──────────────────────────────────────────────────────────────────
+  // ── 404 ───────────────────────────────────────────────────────────────────
   return jsonError(res, 404, `Unknown endpoint: ${path}`, {
     availableEndpoints: [
       '/health', '/status', '/start', '/stop',
       '/jump', '/move', '/sneak', '/stopaction',
-      '/ip?value=x', '/port?value=x', '/rename?value=x', '/version?value=x'
-    ]
+      '/ip?value=x', '/port?value=x', '/rename?value=x', '/version?value=x',
+      '/pingserver',
+    ],
   });
 });
 
 server.listen(PORT, () => {
   console.log('');
-  console.log('🛡️  DERTORRAP ANTI AFK BOT');
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('🛡️  DERTORRAP ANTI AFK BOT v3.0');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(`🌐 Server running on port ${PORT}`);
   console.log(`📊 Dashboard: http://localhost:${PORT}/health`);
   console.log(`📡 All endpoints: http://localhost:${PORT}/status`);
-  if (API_KEY) console.log(`🔒 API key protection enabled`);
+  if (API_KEY) console.log('🔒 API key protection enabled');
   console.log('');
 });
 
 process.on('uncaughtException', (err) => { log(`Uncaught: ${err.message}`); });
 process.on('unhandledRejection', (reason) => { log(`Rejection: ${reason}`); });
+
